@@ -1,2 +1,4 @@
-flask
-ephem
+streamlit==1.36.0
+pyswisseph==2.10.3.2
+pytz
+python-dateutil
