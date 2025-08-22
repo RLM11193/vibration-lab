@@ -1,18 +1,20 @@
-# Vibration Lab — Law of Vibration (Sidereal/Lahiri)
-# UI revamp: high-contrast, large text, light/dark toggle, bigger controls.
+# Vibration Lab — Full Harmonic Wave (Sidereal/Lahiri)
+# From any Low/High: compute harmonic price/time, scan Asc hits, score confluence,
+# and output ONE best (time, price) prediction. High-contrast UI, phone-friendly.
 
 import math
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 import pytz
 import streamlit as st
 
-# ----- Ephemeris -----
+# ---------- Swiss Ephemeris ----------
 try:
     import swisseph as swe
 except Exception as e:
     raise SystemExit("pyswisseph must be installed (see requirements.txt).") from e
 
-# Sidereal/Lahiri
+# Sidereal / Lahiri (as we tested)
 swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
 EPH_FLAGS = swe.FLG_SIDEREAL | swe.FLG_MOSEPH  # fast, no external files
 
@@ -28,10 +30,10 @@ PLANETS = {
     "Ketu":    swe.TRUE_NODE,
 }
 
-# ===== Helpers =====
+# ---------- helpers ----------
 def jd_ut(dt_utc: datetime) -> float:
     y, m, d = dt_utc.year, dt_utc.month, dt_utc.day
-    h = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600
+    h = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600
     return swe.julday(y, m, d, h, swe.GREG_CAL)
 
 def planet_lon(dt_utc: datetime, name: str) -> float:
@@ -39,24 +41,40 @@ def planet_lon(dt_utc: datetime, name: str) -> float:
     return float(pos[0]) % 360.0
 
 def ascendant(dt_utc: datetime, lat: float, lon_east: float) -> float:
-    # Robust asc using houses() (no flags)
+    # Robust: houses() -> ascmc[0] = Asc
     _, ascmc = swe.houses(jd_ut(dt_utc), lat, lon_east)
     return float(ascmc[0]) % 360.0
 
 def wrap_diff(a: float, b: float) -> float:
+    """Signed minimal angular difference in (-180, 180]."""
     return ((a - b + 180.0) % 360.0) - 180.0
 
-HARMONICS = [0, 30, 45, 60, 90, 120, 135, 180, 225, 240, 270, 315, 360]
-
-def price_angle(P: float) -> float:
+def price_angle_sqrt(P: float) -> float:
+    # θP from square-root spiral (fractional part × 360)
     r = math.sqrt(max(P, 0.0))
     return (360.0 * (r - math.floor(r))) % 360.0
 
-def time_echo_bars(theta_target: float, max_bars: int):
-    s0 = theta_target / 180.0
+def price_angle_cuberoot(P: float) -> float:
+    # optional cube-root field (kept for display; lower weight)
+    r = max(P, 0.0) ** (1/3)
+    return (360.0 * (r - math.floor(r))) % 360.0
+
+def time_angle_sqrt(nbars: float) -> float:
+    r = math.sqrt(max(nbars, 0.0))
+    return (360.0 * (r - math.floor(r))) % 360.0
+
+def time_angle_cuberoot(nbars: float) -> float:
+    r = max(nbars, 0.0) ** (1/3)
+    return (360.0 * (r - math.floor(r))) % 360.0
+
+def time_echo_bars(theta: float, max_bars: int):
+    """
+    Echo rule we used: n ≈ round((theta/180 + 2k)^2), k=1,2,... <= max_bars
+    """
+    s0 = theta / 180.0
     out, k = [], 1
     while True:
-        n = round((s0 + 2 * k) ** 2)
+        n = round((s0 + 2*k) ** 2)
         if n < 1:
             k += 1
             continue
@@ -67,21 +85,49 @@ def time_echo_bars(theta_target: float, max_bars: int):
         k += 1
     return out
 
+def nearest_price_from_angle(anchor_price: float, degree: float, direction: int) -> float:
+    """
+    Map harmonic degree -> price via inverse of θP.
+    degree in [0,360). Choose nearest in the given direction:
+      direction=+1 (from Low -> up)  or  -1 (from High -> down).
+    """
+    frac = (degree % 360.0) / 360.0
+    base = int(math.floor(math.sqrt(max(anchor_price, 0.0))))
+    candidates = []
+    # search a few adjacent spirals
+    for k in range(base-4, base+8):
+        r = k + frac
+        p = r*r
+        d = p - anchor_price
+        if direction > 0 and d <= 0:   # want up from low
+            continue
+        if direction < 0 and d >= 0:   # want down from high
+            continue
+        candidates.append((abs(d), p))
+    if not candidates:  # fallback: ignore direction, pick nearest
+        for k in range(base-4, base+8):
+            r = k + frac
+            p = r*r
+            candidates.append((abs(p - anchor_price), p))
+    return min(candidates, key=lambda x: x[0])[1]
+
 def find_asc_hits(start_utc: datetime, end_utc: datetime,
-                  lat: float, lon_east: float,
-                  target_deg: float, tol: float = 1.0,
-                  step_min: int = 5):
+                  lat: float, lon_east: float, target_deg: float,
+                  tol: float = 1.0, step_min: int = 5):
+    """
+    Scan over [start,end], detect when Asc crosses target_deg, refine by bisection.
+    Returns list[datetime UTC] of hits.
+    """
     hits = []
     t = start_utc
     step = timedelta(minutes=step_min)
     prev = wrap_diff(ascendant(t, lat, lon_east), target_deg)
-
     while t <= end_utc:
         t2 = t + step
         cur = wrap_diff(ascendant(t2, lat, lon_east), target_deg)
-        if prev * cur <= 0:  # crossed target
+        if prev * cur <= 0:  # crossed
             a, b = t, t2
-            for _ in range(12):  # bisection refine
+            for _ in range(12):
                 mid = a + (b - a) / 2
                 dmid = wrap_diff(ascendant(mid, lat, lon_east), target_deg)
                 if abs(dmid) <= tol:
@@ -95,213 +141,211 @@ def find_asc_hits(start_utc: datetime, end_utc: datetime,
         t, prev = t2, cur
     return hits
 
-# ===== UI THEME =====
+# ---------- UI theme ----------
 st.set_page_config(page_title="Vibration Lab", page_icon="✨", layout="centered")
-
-def inject_css(theme: str = "dark", font_scale: float = 1.12, compact: bool = False):
-    # Palette
+def css(theme="dark"):
     if theme == "dark":
-        bg = "#0c0f14"
-        card = "#151a21"
-        text = "#f2f5f8"
-        sub = "#a9b3bf"
-        accent = "#08e0d1"
-        border = "#262e39"
-        shadow = "0 10px 28px rgba(0,0,0,.45)"
-    else:  # light
-        bg = "#f7f9fc"
-        card = "#ffffff"
-        text = "#0e1116"
-        sub = "#5d6b7b"
-        accent = "#0aa3ff"
-        border = "#e7eef6"
-        shadow = "0 8px 22px rgba(2,18,51,.08)"
-
-    fs = f"{font_scale}rem"
-    line = "1.65" if not compact else "1.45"
-    pad = "18px" if not compact else "12px"
-    gap = "16px" if not compact else "10px"
-    inp = "52px" if not compact else "44px"
-    btn = "54px" if not compact else "46px"
-
-    css = f"""
+        bg, card, text, sub, acc, brd = "#0c0f14", "#151a21", "#f2f5f8", "#a9b3bf", "#08e0d1", "#26303a"
+        sh = "0 10px 28px rgba(0,0,0,.45)"
+    else:
+        bg, card, text, sub, acc, brd = "#f7f9fc", "#ffffff", "#0e1116", "#5d6b7b", "#0aa3ff", "#e7eef6"
+        sh = "0 8px 22px rgba(2,18,51,.08)"
+    st.markdown(f"""
     <style>
-    .stApp {{ background:{bg}; color:{text}; }}
-    div.block-container {{ max-width: 900px; padding-top: 10px; }}
-    html, body, [class^="css"] {{ font-size:{fs}; line-height:{line}; }}
-    .card {{ background:{card}; border:1px solid {border}; border-radius:18px; padding:{pad}; box-shadow:{shadow}; }}
-    .card + .card {{ margin-top:{gap}; }}
-    .accent {{ color:{accent}; }}
-    .muted {{ color:{sub}; }}
-    .pill {{ display:inline-block; padding:6px 12px; border-radius:999px; background:rgba(100,100,100,.12); margin:6px 8px 0 0; }}
-    .bigbtn button {{ height:{btn}; font-weight:700; font-size:1.05rem; }}
-    .stButton>button {{ border-radius:12px; }}
-    .stSelectbox>div>div, .stTextInput>div>div>input, .stNumberInput>div>div>input, .stTimeInput>div>div>input,
-    .stDateInput>div>div>input {{ height:{inp}; font-size:1.02rem; }}
-    .stSlider [data-baseweb="slider"] {{ margin-top:4px; }}
-    hr.sep {{ border:none; border-top:1px solid {border}; margin: 12px 0; }}
+      .stApp{{background:{bg};color:{text}}}
+      div.block-container{{max-width:920px;padding-top:10px}}
+      .card{{background:{card};border:1px solid {brd};border-radius:18px;padding:18px;box-shadow:{sh}}}
+      .card + .card{{margin-top:16px}}
+      .accent{{color:{acc}}}
+      .pill{{display:inline-block;padding:6px 12px;border-radius:999px;background:rgba(120,120,120,.12);margin:6px 8px 0 0}}
+      .bigbtn button{{height:54px;font-weight:700;font-size:1.05rem;border-radius:12px}}
+      .stSelectbox>div>div, .stNumberInput input, .stTextInput input,
+      .stTimeInput input, .stDateInput input{{height:52px;font-size:1.02rem}}
+      hr.sep{{border:none;border-top:1px solid {brd};margin:12px 0}}
     </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
-
-# Sidebar controls for visual tuning
+    """, unsafe_allow_html=True)
 with st.sidebar:
     st.markdown("### Display")
-    theme = st.radio("Theme", ["Dark", "Light"], index=0, horizontal=True)
-    size = st.radio("Text size", ["Large", "Normal"], index=0, horizontal=True)
-    density = st.radio("Density", ["Comfortable", "Compact"], index=0, horizontal=True)
+    theme = st.radio("Theme", ["Dark","Light"], index=0, horizontal=True)
+css(theme.lower())
+st.markdown("<h2 class='accent'>Vibration Lab — Full Harmonic Wave</h2>", unsafe_allow_html=True)
 
-inject_css(
-    theme.lower(),
-    font_scale=1.18 if size == "Large" else 1.0,
-    compact=True if density == "Compact" else False
-)
-
-st.markdown("<h2 class='accent'>Vibration Lab — Law of Vibration (Sidereal/Lahiri)</h2>", unsafe_allow_html=True)
-
-# ===== INPUTS =====
+# ---------- INPUTS ----------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-col1, col2 = st.columns([3, 2])
+st.markdown("**1) Swing points** (use exact timestamps)")
+c1, c2 = st.columns(2)
+with c1:
+    low_price = st.number_input("Swing LOW price", min_value=0.0, value=3267.89, step=0.01)
+    low_date  = st.date_input("LOW date", value=datetime(2025,7,30).date())
+    low_time  = st.time_input("LOW time", value=datetime(2025,7,30,13,0).time())
+with c2:
+    high_price = st.number_input("Swing HIGH price", min_value=0.0, value=3407.35, step=0.01)
+    high_date  = st.date_input("HIGH date", value=datetime(2025,8,7).date())
+    high_time  = st.time_input("HIGH time", value=datetime(2025,8,7,16,0).time())
 
-with col1:
-    symbol  = st.text_input("Symbol", "NAS100")
-    price   = st.number_input("Anchor Price (exact pivot price)", min_value=0.0, value=23984.9, step=0.1)
-    tzname  = st.selectbox("Timezone", ["America/Denver", "America/New_York", "UTC"], index=0)
-    tzloc   = pytz.timezone(tzname)
-    d_local = st.date_input("Anchor Date (local)", value=datetime(2025, 8, 13).date())
-    t_local = st.time_input("Anchor Time (local)", value=datetime(2025, 8, 13, 7, 30).time())
-    barmin  = st.number_input("Bar Interval (minutes)", min_value=1, value=60, step=1)
-    horizon = st.slider("Scan horizon (hours from anchor)", 6, 120, 48, step=6)
+st.markdown("**2) Projection**")
+c3, c4 = st.columns(2)
+with c3:
+    project_from = st.radio("Anchor to project from", ["Low","High"], index=1, horizontal=True)
+    direction = 1 if project_from=="Low" else -1  # up from low, down from high
+    barmin = st.number_input("Bar interval (minutes)", min_value=1, value=60, step=1)
+    horizon_h = st.slider("Scan horizon (hours from anchor)", 6, 144, 72, step=6)
+with c4:
+    tzname = st.selectbox("Timezone", ["America/Denver","America/New_York","UTC"], index=0)
+    tzloc  = pytz.timezone(tzname)
+    lat    = st.number_input("Latitude (deg)", value=38.84, step=0.01)
+    lonW   = st.number_input("Longitude West (deg, positive=West)", value=106.13, step=0.01)
+    lonE   = -abs(lonW)  # East-positive for Swiss Ephemeris
+    tol    = st.slider("Angular tolerance (±°)", 0.2, 2.0, 1.0, 0.1)
 
-with col2:
-    st.caption("Use the exact minute of the pivot (event-time).")
-    lat   = st.number_input("Latitude (deg)", value=38.84, step=0.01)
-    lonW  = st.number_input("Longitude West (deg, positive=West)", value=106.13, step=0.01)
-    lonE  = -abs(lonW)  # East-positive for Swiss Ephemeris
-    tol   = st.slider("Angular tolerance (±°)", 0.2, 2.0, 1.0, 0.1)
-    mobile = st.toggle("Mobile mode (optimize speed)", value=True)
-
-with st.expander("Optional numerology (for notes)"):
-    user_bars  = st.text_input("Bar count (optional)", "")
-    user_range = st.text_input("Price move (optional)", "")
+with st.expander("Options"):
+    mobile = st.toggle("Mobile mode (fewer targets, faster)", value=True)
+    extra_targets = st.toggle("Add inner-planet & harmonic (+90/+120) targets", value=not mobile)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# Run button
+# Run
 st.markdown("<div class='bigbtn'>", unsafe_allow_html=True)
-run = st.button("Run / Recompute", type="primary", use_container_width=True)
-st.markdown("</div>", unsafe_allow_html=True)
-if not run:
+if not st.button("Run / Recompute", type="primary", use_container_width=True):
     st.stop()
+st.markdown("</div>", unsafe_allow_html=True)
 
-# ===== COMPUTE =====
-anchor_local = tzloc.localize(datetime.combine(d_local, t_local))
-anchor_utc   = anchor_local.astimezone(pytz.utc)
-theta_p = price_angle(price)
+# ---------- build anchor & swing ----------
+low_local  = tzloc.localize(datetime.combine(low_date, low_time))
+high_local = tzloc.localize(datetime.combine(high_date, high_time))
+low_utc, high_utc = low_local.astimezone(pytz.utc), high_local.astimezone(pytz.utc)
 
+if project_from == "Low":
+    anchor_price, anchor_local, anchor_utc = low_price, low_local, low_utc
+    other_price, other_local = high_price, high_local
+else:
+    anchor_price, anchor_local, anchor_utc = high_price, high_local, high_utc
+    other_price, other_local = low_price, low_local
+
+swing_minutes = abs(int((high_local - low_local).total_seconds() // 60))
+swing_bars = max(1, round(swing_minutes / barmin))
+
+# ---------- harmonic angles ----------
+thetaP_sqrt = price_angle_sqrt(anchor_price)
+thetaP_cube = price_angle_cuberoot(anchor_price)
+thetaT_sqrt = time_angle_sqrt(swing_bars)
+thetaT_cube = time_angle_cuberoot(swing_bars)
+
+# Base targets
 targets = [
     ("Saturn",  planet_lon(anchor_utc, "Saturn"),  3),
     ("Jupiter", planet_lon(anchor_utc, "Jupiter"), 3),
-    (f"θP({theta_p:.2f}°)", theta_p, 2),
-    (f"θP+180({(theta_p+180)%360:.2f}°)", (theta_p + 180) % 360, 2),
+    (f"θP({thetaP_sqrt:.2f}°)", thetaP_sqrt, 2),
+    (f"θP+180({(thetaP_sqrt+180)%360:.2f}°)", (thetaP_sqrt+180)%360, 2),
 ]
-if not mobile:
+# Optional enrichments
+if extra_targets:
     targets += [
-        (f"θP+90({(theta_p+90)%360:.2f}°)",  (theta_p + 90) % 360,  1),
-        (f"θP+120({(theta_p+120)%360:.2f}°)", (theta_p + 120) % 360, 1),
+        (f"θP+90({(thetaP_sqrt+90)%360:.2f}°)",  (thetaP_sqrt+90)%360, 1),
+        (f"θP+120({(thetaP_sqrt+120)%360:.2f}°)", (thetaP_sqrt+120)%360,1),
         ("Mercury", planet_lon(anchor_utc, "Mercury"), 2),
         ("Venus",   planet_lon(anchor_utc, "Venus"),   1),
         ("Mars",    planet_lon(anchor_utc, "Mars"),    1),
     ]
 
-max_bars = int((horizon * 60) // barmin)
-echo_rows = []
-for label, deg, _w in targets:
-    for n in time_echo_bars(deg, max_bars=max_bars):
-        echo_rows.append((label, deg, n, anchor_local + timedelta(minutes=barmin * n)))
-echo_rows.sort(key=lambda r: r[3])
+# ---------- time echoes ----------
+max_bars = int((horizon_h * 60) // barmin)
+echo_from_thetaP = time_echo_bars(thetaP_sqrt, max_bars)
+echo_from_thetaT = time_echo_bars(thetaT_sqrt, max_bars)
 
+# ---------- scan Asc hits & score ----------
 start_utc = anchor_utc
-end_utc   = anchor_utc + timedelta(hours=horizon)
-hits = []
-for label, deg, weight in targets:
-    for hit in find_asc_hits(start_utc, end_utc, lat, lonE, deg, tol, step_min=5):
-        moon_deg = planet_lon(hit, "Moon")
-        moon_ok  = abs(wrap_diff(moon_deg, deg)) <= tol
-        score    = 2 * weight + (weight if moon_ok else 0)
-        hits.append((hit.astimezone(tzloc), label, deg, moon_ok, score))
-hits.sort(key=lambda r: (r[0], -r[4]))
+end_utc   = anchor_utc + timedelta(hours=horizon_h)
 
-# ===== OUTPUT =====
+candidates = []  # (score, T_local, target_label, target_deg, n_bars, price_est, diagnostics)
+
+for label, deg, weight in targets:
+    hits = find_asc_hits(start_utc, end_utc, lat, lonE, deg, tol, step_min=5)
+    for hit_utc in hits:
+        hit_local = hit_utc.astimezone(tzloc)
+        # bar count from anchor
+        n_bars = max(1, round((hit_local - anchor_local).total_seconds() / 60 / barmin))
+        # Moon confirm near same degree at the hit time
+        moon_deg = planet_lon(hit_utc, "Moon")
+        moon_ok = abs(wrap_diff(moon_deg, deg)) <= tol
+        # echo scores
+        echo_okP = n_bars in echo_from_thetaP
+        echo_okT = n_bars in echo_from_thetaT
+        # price projection from harmonic degree
+        price_est = nearest_price_from_angle(anchor_price, deg, direction)
+        # score
+        score = 0
+        score += 2 * weight                     # base weight of target
+        if moon_ok: score += weight             # moon confirm
+        if echo_okP: score += 2
+        if echo_okT: score += 2
+        # prefer closer-in solutions slightly
+        score += max(0, 6 - int(n_bars // 50))
+        diag = {
+            "moon_ok": moon_ok,
+            "echoP": echo_okP,
+            "echoT": echo_okT,
+            "θP": thetaP_sqrt, "θT": thetaT_sqrt,
+        }
+        candidates.append((score, hit_local, label, deg, n_bars, price_est, diag))
+
+# choose best
+candidates.sort(key=lambda x: (-x[0], x[1]))
+final = candidates[0] if candidates else None
+
+# ---------- OUTPUT ----------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown(f"### Vibration Angle θP: <span class='accent'>{theta_p:.2f}°</span>", unsafe_allow_html=True)
-st.markdown(
-    " ".join([
-        f"<span class='pill'>θP {theta_p:.2f}°</span>",
-        f"<span class='pill'>+90 {(theta_p+90)%360:.2f}°</span>",
-        f"<span class='pill'>+120 {(theta_p+120)%360:.2f}°</span>",
-        f"<span class='pill'>+180 {(theta_p+180)%360:.2f}°</span>",
-    ]),
-    unsafe_allow_html=True,
+st.subheader("Harmonic summary (at anchor)")
+st.write(
+    f"• Price √ angle θP = **{thetaP_sqrt:.2f}°**"
+    f"   · Price ³√ angle = **{thetaP_cube:.2f}°**"
+)
+st.write(
+    f"• Time √ angle θT (between Low↔High over {swing_bars} bars) = **{thetaT_sqrt:.2f}°**"
+    f"   · Time ³√ angle = **{thetaT_cube:.2f}°**"
+)
+st.write(
+    f"• Echo bars from θP: {echo_from_thetaP[:10]}{' …' if len(echo_from_thetaP)>10 else ''}"
+)
+st.write(
+    f"• Echo bars from θT: {echo_from_thetaT[:10]}{' …' if len(echo_from_thetaT)>10 else ''}"
 )
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.subheader("Next Resonance Windows (Ascendant hits)")
-st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
-if not hits:
-    st.write("No Asc hits in range. Try ±1.5° tolerance or extend horizon.")
+st.subheader("Top resonance candidates")
+if not candidates:
+    st.write("No confluence found in horizon. Try a wider tolerance or extend horizon.")
 else:
-    strong = [h for h in hits if h[4] >= 6][:8]
-    medium = [h for h in hits if 4 <= h[4] < 6][:8]
-    if strong:
-        st.markdown("**Strong**")
-        for T, lbl, deg, moon, score in strong:
-            st.write(
-                f"🟢 **{T.strftime('%a %b %d, %H:%M %Z')}** — ASC ≈ **{lbl}** ({deg:.2f}°)"
-                f"{' · **+ Moon**' if moon else ''} · Score **{score}**"
-            )
-        st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
-    if medium:
-        st.markdown("**Medium**")
-        for T, lbl, deg, moon, score in medium:
-            st.write(
-                f"🟡 **{T.strftime('%a %b %d, %H:%M %Z')}** — ASC ≈ **{lbl}** ({deg:.2f}°)"
-                f"{' · + Moon' if moon else ''} · Score {score}"
-            )
+    for i, (score, Tloc, lbl, deg, n, p, diag) in enumerate(candidates[:8], start=1):
+        flags = []
+        if diag["moon_ok"]: flags.append("Moon✓")
+        if diag["echoP"]:   flags.append("EchoθP✓")
+        if diag["echoT"]:   flags.append("EchoθT✓")
+        flag_txt = (" · " + " · ".join(flags)) if flags else ""
+        st.write(
+            f"{i}. **{Tloc.strftime('%a %b %d, %H:%M %Z')}**"
+            f" — ASC ≈ **{lbl}** ({deg:.2f}°)"
+            f" · bars **{n}** · est. price **{p:.2f}**"
+            f" · score **{score}**{flag_txt}"
+        )
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.subheader("Time-Echo Bars → Clock Times")
-st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
-for label, deg, n, tloc in echo_rows[:80]:
-    st.write(f"- **N={n:>3}** → **{tloc.strftime('%a %b %d, %H:%M %Z')}** · target **{label}** ({deg:.2f}°)")
+st.subheader("FINAL prediction (single time & price)")
+if final is None:
+    st.write("No candidate passed the filters. Increase horizon or tolerance.")
+else:
+    score, Tloc, lbl, deg, n, p, diag = final
+    st.markdown(
+        f"### ⏱ {Tloc.strftime('%A %b %d, %H:%M %Z')}  ·  💵 {p:.2f}\n"
+        f"- Target: **{lbl}** ({deg:.2f}°)\n"
+        f"- Bars from anchor: **{n}**\n"
+        f"- Confluence: {'Moon✓ ' if diag['moon_ok'] else ''}"
+        f"{'EchoθP✓ ' if diag['echoP'] else ''}"
+        f"{'EchoθT✓ ' if diag['echoT'] else ''}"
+        f"- Score: **{score}**"
+    )
 st.markdown("</div>", unsafe_allow_html=True)
 
-if user_bars.strip() or user_range.strip():
-    def digit_root(x: int) -> int:
-        x = abs(int(x))
-        return 9 if x % 9 == 0 and x != 0 else (x % 9)
-
-    notes = []
-    if user_bars.strip().isdigit():
-        nb = int(user_bars.strip())
-        notes.append(f"Bars: {nb} → digital root {digit_root(nb)}")
-        notes.append(f"Bars mod 12 = {nb % 12}, mod 27 = {nb % 27}, mod 60 = {nb % 60}")
-    try:
-        pr = float(user_range.strip())
-        cents = int(round(abs(pr) * 100))
-        notes.append(f"Price move {pr} → scaled 100x = {cents}, digital root {digit_root(cents)}")
-    except Exception:
-        pass
-
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("Numerology (notes)")
-    st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
-    if notes:
-        for line in notes: st.write("• " + line)
-    else:
-        st.write("Enter a bar count or price move to see quick numerology.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.caption("Intraday = Asc timer · Swing = Moon confirm · Framework = Saturn/Jupiter · Sidereal (Lahiri).")
+st.caption("Intraday timing = Ascendant hits · Swing confirmation = Moon · Framework = Saturn/Jupiter · Sidereal (Lahiri).")
