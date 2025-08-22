@@ -1,4 +1,5 @@
-streamlit==1.36.0
-pyswisseph==2.10.3.2
+streamlit
+pyswisseph
+numpy
+pandas
 pytz
-python-dateutil
