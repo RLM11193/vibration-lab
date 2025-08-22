@@ -1,121 +1,118 @@
-# app.py
 import streamlit as st
-import swisseph as swe
-import datetime
-import math
+import numpy as np
+from datetime import datetime, timedelta
+from math import isnan
 
-# --- Utility functions ---
-def wrap_deg(x):
-    return x % 360.0
+# === Astrology calc imports ===
+from flatlib import ephem, const, angle
+from flatlib.chart import Chart
+from flatlib.datetime import Datetime
+from flatlib.geopos import GeoPos
 
-def angular_diff(a, b):
+# === Setup ===
+PLANETS = [const.SUN, const.MOON, const.MERCURY, const.VENUS, const.MARS,
+           const.JUPITER, const.SATURN, const.URANUS, const.NEPTUNE, const.PLUTO]
+
+# Utility
+def angle_diff(a, b):
+    """ Smallest difference in degrees between two angles """
     d = abs(a - b) % 360
     return d if d <= 180 else 360 - d
 
-def jd_from_dt_utc(dt):
-    return swe.julday(dt.year, dt.month, dt.day,
-                      dt.hour + dt.minute/60 + dt.second/3600)
+# Cached planet positions
+def cached_positions(times, pos):
+    lon_map, dec_map = {}, {}
 
-# --- Planet list ---
-PLANETS = {
-    "Sun": swe.SUN,
-    "Moon": swe.MOON,
-    "Mercury": swe.MERCURY,
-    "Venus": swe.VENUS,
-    "Mars": swe.MARS,
-    "Jupiter": swe.JUPITER,
-    "Saturn": swe.SATURN,
-    "Uranus": swe.URANUS,
-    "Neptune": swe.NEPTUNE,
-    "Pluto": swe.PLUTO,
-}
+    for p in PLANETS:
+        lons, decs = [], []
+        for t in times:
+            try:
+                dt = Datetime(t.strftime("%Y-%m-%d %H:%M"), pos.timezone)
+                chart = Chart(dt, pos)
+                obj = chart.get(p)
+                lons.append(obj.lon)
+                decs.append(obj.lat)
+            except Exception:
+                lons.append(np.nan)
+                decs.append(np.nan)
+        lon_map[p] = np.array(lons)
+        dec_map[p] = np.array(decs)
 
-ASPECTS = {
-    "Conjunction (0°)": 0,
-    "Sextile (60°)": 60,
-    "Square (90°)": 90,
-    "Trine (120°)": 120,
-    "Opposition (180°)": 180,
-}
+    return lon_map, dec_map
 
-# --- Core calculation ---
-def get_positions(jd, lat, lon, sidereal=False):
-    flags = swe.FLG_MOSEPH
-    if sidereal:
-        swe.set_sid_mode(swe.SIDM_LAHIRI)
-        flags |= swe.FLG_SIDEREAL
+# Trigger logic
+def trigger_check(times, lon_map, asc_arr, moon_arr):
+    alerts = []
+    for i, t in enumerate(times):
+        asc = asc_arr[i]
+        moon = moon_arr[i]
 
-    positions = {}
-    for name, pid in PLANETS.items():
-        try:
-            lon, _lat, _dist, _speed = swe.calc_ut(jd, pid, flags)
-            positions[name] = wrap_deg(lon)
-        except Exception as e:
-            positions[name] = float("nan")
-
-    # Ascendant / Houses
-    try:
-        cusps, ascmc = swe.houses_ex(jd, lat, lon, b'P', flags)
-        positions["Ascendant"] = wrap_deg(ascmc[0])
-    except Exception:
-        positions["Ascendant"] = float("nan")
-
-    return positions
-
-# --- Triggers logic ---
-def check_triggers(positions):
-    events = []
-    asc = positions.get("Ascendant", float("nan"))
-    moon = positions.get("Moon", float("nan"))
-
-    if math.isnan(asc) or math.isnan(moon):
-        return ["Ascendant or Moon not available"]
-
-    # Asc → Moon trigger
-    for name, lon in positions.items():
-        if name in ["Ascendant", "Moon"] or math.isnan(lon):
+        if isnan(asc) or isnan(moon):
             continue
-        for aspect_name, aspect_angle in ASPECTS.items():
-            if angular_diff(moon, lon) < 2:  # ±2° orb
-                events.append(f"Moon triggered {name} ({aspect_name})")
 
-    # Ascendant → Moon trigger
-    for aspect_name, aspect_angle in ASPECTS.items():
-        if angular_diff(asc, moon) < 2:
-            events.append(f"Ascendant triggered Moon ({aspect_name})")
+        # Moon ↔ Asc
+        if angle_diff(moon, asc) < 1:
+            alerts.append(f"{t}: Moon {moon:.1f}° conjunct Asc {asc:.1f}°")
 
-    return events if events else ["No exact triggers now"]
+        # Asc ↔ Planets
+        for p, lons in lon_map.items():
+            if isnan(lons[i]): 
+                continue
+            for asp in [0, 90, 120, 180]:
+                if angle_diff(asc, lons[i]) < 1 and angle_diff(asc, lons[i]) == asp:
+                    alerts.append(f"{t}: Asc {asc:.1f}° {asp}° {p} {lons[i]:.1f}°")
 
-# --- Streamlit UI ---
-def main():
-    st.title("Gann Astro-Vibration Scanner")
+        # Moon ↔ Planets
+        for p, lons in lon_map.items():
+            if isnan(lons[i]): 
+                continue
+            for asp in [0, 90, 120, 180]:
+                if angle_diff(moon, lons[i]) < 1 and angle_diff(moon, lons[i]) == asp:
+                    alerts.append(f"{t}: Moon {moon:.1f}° {asp}° {p} {lons[i]:.1f}°")
 
-    # Inputs
-    col1, col2 = st.columns(2)
-    with col1:
-        date = st.date_input("Date", datetime.date.today())
-        time = st.time_input("Time (UTC)", datetime.datetime.utcnow().time())
-    with col2:
-        lat = st.number_input("Latitude", -90.0, 90.0, 39.0)
-        lon = st.number_input("Longitude", -180.0, 180.0, -105.0)
-        sidereal = st.checkbox("Use Sidereal (Lahiri)", value=True)
+    return alerts
 
-    # JD
-    dt = datetime.datetime.combine(date, time)
-    jd = jd_from_dt_utc(dt)
+# === Streamlit App ===
+st.set_page_config(layout="wide")
+st.title("📈 Harmonic Vibration Wave Analyzer")
 
-    # Positions
-    positions = get_positions(jd, lat, lon, sidereal)
+# Inputs
+st.sidebar.header("Settings")
+lat = st.sidebar.number_input("Latitude", value=39.0)
+lon = st.sidebar.number_input("Longitude", value=-105.0)
+tz = st.sidebar.text_input("Timezone", "0:00")
+start_date = st.sidebar.date_input("Start Date", datetime.utcnow().date())
+bars = st.sidebar.number_input("Bars (hours)", value=48)
 
-    st.subheader("Planetary Longitudes")
-    for name, lon in positions.items():
-        st.write(f"{name}: {lon:.2f}°")
+pos = GeoPos(lat, lon)
+times = [start_date + timedelta(hours=i) for i in range(int(bars))]
 
-    # Aspects
-    st.subheader("Aspects to Ascendant & Moon")
-    events = check_triggers(positions)
-    for e in events:
-        st.write("- " + e)
+# Compute
+lon_map, dec_map = cached_positions(times, pos)
 
-if __name__ == "__main__":
-    main()
+# Ascendant & Moon arrays
+asc_arr, moon_arr = [], []
+for t in times:
+    try:
+        dt = Datetime(t.strftime("%Y-%m-%d %H:%M"), tz)
+        chart = Chart(dt, pos)
+        asc_arr.append(chart.get(const.ASC).lon)
+        moon_arr.append(chart.get(const.MOON).lon)
+    except Exception:
+        asc_arr.append(np.nan)
+        moon_arr.append(np.nan)
+asc_arr = np.array(asc_arr)
+moon_arr = np.array(moon_arr)
+
+# Display sections
+st.subheader("Planetary Positions")
+for p in PLANETS:
+    st.write(f"{p}: {lon_map[p][-1]:.2f}°")
+
+st.subheader("Trigger Alerts")
+alerts = trigger_check(times, lon_map, asc_arr, moon_arr)
+if alerts:
+    for a in alerts:
+        st.write("🔔", a)
+else:
+    st.write("No exact triggers found in this window.")
