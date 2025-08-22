@@ -1,187 +1,104 @@
 import streamlit as st
 import numpy as np
-from datetime import datetime, date
-from skyfield.api import load, wgs84
+from skyfield.api import load, Topos
+from datetime import datetime, timedelta
+import math
 
-# --------------- Stable setup (cached) ---------------
-
-@st.cache_resource
-def get_timescale_and_ephemeris():
-    ts = load.timescale()
-    eph = load('de421.bsp')  # auto-downloads once, then cached on Streamlit
-    return ts, eph
-
-ts, eph = get_timescale_and_ephemeris()
-
-PLANET_KEYS = {
-    "Sun": "sun",
-    "Moon": "moon",
-    "Mercury": "mercury",
-    "Venus": "venus",
-    "Mars": "mars",
-    "Jupiter": "jupiter barycenter",
-    "Saturn": "saturn barycenter",
-    "Uranus": "uranus barycenter",
-    "Neptune": "neptune barycenter",
-    "Pluto": "pluto barycenter",
-}
-
-# --------------- Math helpers ---------------
-
-def wrap_deg(x: float) -> float:
-    return x % 360.0
-
-def ang_diff(a: float, b: float) -> float:
-    """Smallest absolute angular difference in degrees."""
-    d = abs((a - b) % 360.0)
-    return d if d <= 180.0 else 360.0 - d
-
-def approx_asc_deg(time_obj, lon_deg: float) -> float:
-    """
-    Simple + fast Ascendant proxy:
-      LST ≈ GAST + longitude
-      We use LST in degrees as a clean intraday timer (good trigger proxy).
-    """
-    gast_deg = (time_obj.gast * 15.0) % 360.0
-    lst_deg = (gast_deg + lon_deg) % 360.0
-    return lst_deg
-
-# --------------- Astro computation ---------------
-
-@st.cache_data(show_spinner=False)
-def compute_ecliptic_lons(lat_deg: float, lon_deg: float, start_d: date, hours: int):
-    """Return dict of planet→lon arrays + separate arrays for Moon + Asc proxy."""
-    observer = wgs84.latlon(latitude_degrees=lat_deg, longitude_degrees=lon_deg)
-
-    times = [ts.utc(start_d.year, start_d.month, start_d.day, h) for h in range(int(hours))]
-    # Pre-size containers
-    lon_map = {name: np.zeros(len(times), dtype=float) for name in PLANET_KEYS.keys()}
-
-    for i, t in enumerate(times):
-        # Asc proxy (LST)
-        lon_map.setdefault("ASC", np.zeros(len(times), dtype=float))
-        lon_map["ASC"][i] = approx_asc_deg(t, lon_deg)
-
-        # Planet ecliptic longitudes
-        for name, key in PLANET_KEYS.items():
-            try:
-                astrometric = observer.at(t).observe(eph[key]).apparent()
-                lon, lat, _ = astrometric.ecliptic_latlon()
-                lon_map[name][i] = wrap_deg(lon.degrees)
-            except Exception:
-                lon_map[name][i] = np.nan  # never crash the app
-
-    return times, lon_map
-
-def find_triggers(times, lon_map, tol_deg: float):
-    """Asc ↔ Moon ↔ Planets triggers at 0/90/120/180 ± tolerance."""
-    aspects = [0, 90, 120, 180]
-    alerts = []
-    asc = lon_map["ASC"]
-    moon = lon_map["Moon"]
-
-    for i, t in enumerate(times):
-        if np.isnan(asc[i]) or np.isnan(moon[i]):
-            continue
-
-        # Moon ↔ Asc conjunct
-        if ang_diff(moon[i], asc[i]) <= tol_deg:
-            alerts.append(f"{t.utc_strftime('%Y-%m-%d %H:%M')} • Moon {moon[i]:.1f}° conjunct ASC {asc[i]:.1f}°")
-
-        # Asc ↔ Planets aspects
-        for pname, arr in lon_map.items():
-            if pname in ("ASC", "Moon"):  # handled separately
-                continue
-            if np.isnan(arr[i]):
-                continue
-            for asp in aspects:
-                if abs(ang_diff(asc[i], arr[i]) - asp) <= tol_deg:
-                    alerts.append(
-                        f"{t.utc_strftime('%Y-%m-%d %H:%M')} • ASC {asc[i]:.1f}° {asp}° {pname} {arr[i]:.1f}°"
-                    )
-
-        # Moon ↔ Planets aspects
-        for pname, arr in lon_map.items():
-            if pname in ("ASC", "Moon"):
-                continue
-            if np.isnan(arr[i]):
-                continue
-            for asp in aspects:
-                if abs(ang_diff(moon[i], arr[i]) - asp) <= tol_deg:
-                    alerts.append(
-                        f"{t.utc_strftime('%Y-%m-%d %H:%M')} • Moon {moon[i]:.1f}° {asp}° {pname} {arr[i]:.1f}°"
-                    )
-
-    return alerts
-
-# --------------- Vibration math (price–time) ---------------
-
-def vibration_math(price_high: float, price_low: float, swing_bars: int):
-    """
-    Compact “law of vibration” scaffold:
-    - Price angle via sqrt transform
-    - ΔP from sin(angle), ΔT from cos(sqrt(bars))
-    Returns (target_price, delta_price, delta_time_bars)
-    """
-    sqrt_high = np.sqrt(max(price_high, 0.0))
-    sqrt_low = np.sqrt(max(price_low, 0.0))
-    price_angle = (sqrt_high - sqrt_low) * 180.0  # deg
-
-    dP = 144.0 * np.sin(np.radians(price_angle % 360.0))
-    dT = 225.0 * np.cos(np.radians((np.sqrt(max(swing_bars, 0)) * 180.0) % 360.0))
-
-    target_price = price_high + dP
-    return float(target_price), float(dP), float(dT)
-
-# --------------- UI ---------------
-
+# ✅ Must be first
 st.set_page_config(page_title="Vibrations", layout="wide")
-st.markdown("<h1 style='text-align:center'>📈 Vibrational Harmonics Lab — Gann Fusion</h1>", unsafe_allow_html=True)
 
-with st.sidebar:
-    st.subheader("Location & Window")
-    lat = st.number_input("Latitude (°)", value=38.84, step=0.01, format="%.2f")
-    lon = st.number_input("Longitude West=− (°)", value=-106.13, step=0.01, format="%.2f")
-    start_d = st.date_input("Start date (UTC)", value=date.today())
-    hours = st.slider("Scan horizon (hours ahead)", 12, 240, 120, step=12)
-    tol = st.slider("Aspect tolerance (°)", 0.2, 2.0, 1.0, step=0.1)
+# Load planetary data
+planets = load('de421.bsp')
+earth = planets['earth']
+ts = load.timescale()
 
-    st.markdown("---")
-    st.subheader("Vibration Inputs")
-    swing_high = st.number_input("Swing HIGH price", value=45761.88, format="%.2f")
-    swing_low = st.number_input("Swing LOW price", value=43335.46, format="%.2f")
-    swing_bars = st.number_input("Swing length (bars)", value=34, step=1)
+# Location (BV, Colorado – change if needed)
+observer = Topos(latitude_degrees=38.84, longitude_degrees=-106.13)
 
-# Compute astro
-times, lon_map = compute_ecliptic_lons(lat, lon, start_d, hours)
+# Utility: planetary longitude (tropical for now, can add Lahiri sidereal later)
+def planetary_longitude(planet_name, date_time):
+    t = ts.utc(date_time.year, date_time.month, date_time.day, date_time.hour, date_time.minute)
+    astrometric = earth.at(t).observe(planets[planet_name])
+    apparent = astrometric.apparent()
+    lon, lat, distance = apparent.ecliptic_latlon()
+    return lon.degrees % 360
 
-# Top row: planetary snapshot
-colL, colR = st.columns([1, 1])
-with colL:
-    st.subheader("Planetary ecliptic longitudes (last hour)")
-    snap = {k: v[-1] for k, v in lon_map.items() if k != "ASC"}
-    lines = [f"• {k:<7}: {snap[k]:6.2f}°" for k in PLANET_KEYS.keys()]
-    st.code("\n".join(lines), language="text")
+# Utility: Ascendant degree
+def ascendant_longitude(date_time):
+    t = ts.utc(date_time.year, date_time.month, date_time.day, date_time.hour, date_time.minute)
+    astrometric = (earth + observer).at(t)
+    ra, dec, distance = astrometric.radec()
+    # Use Earth rotation angle as proxy for Ascendant
+    gst = t.gast
+    asc = (gst * 15) % 360
+    return asc
 
-with colR:
-    st.subheader("ASC & Moon snapshot (last hour)")
-    st.code(f"ASC  : {lon_map['ASC'][-1]:.2f}°\nMoon : {lon_map['Moon'][-1]:.2f}°", language="text")
+# Aspect check
+def check_aspects(angle1, angle2, orb=1.0):
+    aspects = [0, 60, 90, 120, 180]
+    for a in aspects:
+        if abs((angle1 - angle2) % 360 - a) <= orb or abs((angle2 - angle1) % 360 - a) <= orb:
+            return a
+    return None
 
-# Triggers
-st.subheader("🔔 Trigger Alerts (ASC ↔ Moon ↔ Planets)")
-alerts = find_triggers(times, lon_map, tol)
-if alerts:
-    for a in alerts:
-        st.write("•", a)
-else:
-    st.info("No exact triggers found in this window under current tolerance.")
+# Sidebar inputs
+st.sidebar.header("Inputs")
+swing_low = st.sidebar.number_input("Swing Low Price", value=100.0, step=0.1)
+swing_high = st.sidebar.number_input("Swing High Price", value=200.0, step=0.1)
+bars = st.sidebar.number_input("Bars (time units)", value=30, step=1)
+target_planet = st.sidebar.selectbox("Framework Planet", ["saturn", "jupiter", "mars", "venus", "mercury", "sun"])
+start_date = st.sidebar.date_input("Start Date", datetime.utcnow().date())
+start_time = st.sidebar.time_input("Start Time", datetime.utcnow().time())
 
-# Vibration math section
-st.subheader("📐 Vibration Math (ΔP / ΔT)")
-target_price, dP, dT = vibration_math(swing_high, swing_low, int(swing_bars))
-st.write(f"Swing HIGH: **{swing_high:.2f}**  |  Swing LOW: **{swing_low:.2f}**  |  Bars: **{int(swing_bars)}**")
-st.write(f"ΔP (price vibration): **{dP:.2f}**")
-st.write(f"ΔT (time vibration, bars): **{dT:.2f}**")
-st.success(f"🎯 **Target Price**: {target_price:.2f}")
+# Main title
+st.title("📊 Vibrational Harmonics with Ascendant & Moon Triggers")
 
-st.caption("Intraday timing uses ASC; swing confirmation via Moon; framework aligns with Saturn/Jupiter—sidereal proxy via ecliptic longitudes.")
+# Price vibration
+def price_vibration(low, high):
+    diff = math.sqrt(high) - math.sqrt(low)
+    angle = (diff * 180) % 360
+    projection = 144 * math.sin(math.radians(angle))
+    target = high - projection
+    return target, angle
+
+# Time vibration
+def time_vibration(bars):
+    angle = (math.sqrt(bars) * 180) % 360
+    projection = 225 * math.cos(math.radians(angle))
+    return bars + projection, angle
+
+# Run calculations
+price_target, price_angle = price_vibration(swing_low, swing_high)
+time_target, time_angle = time_vibration(bars)
+
+st.subheader("Vibration Targets")
+st.write(f"**Price Target:** {price_target:.2f} (Angle {price_angle:.2f}°)")
+st.write(f"**Time Target (bars):** {time_target:.2f} (Angle {time_angle:.2f}°)")
+
+# Planetary framework
+dt = datetime.combine(start_date, start_time)
+planet_angle = planetary_longitude(target_planet, dt)
+moon_angle = planetary_longitude("moon", dt)
+asc_angle = ascendant_longitude(dt)
+
+aspect_planet_asc = check_aspects(planet_angle, asc_angle)
+aspect_moon_planet = check_aspects(moon_angle, planet_angle)
+aspect_moon_asc = check_aspects(moon_angle, asc_angle)
+
+# Display planetary triggers
+st.subheader("Planetary Framework & Triggers")
+st.write(f"**{target_planet.capitalize()} (Framework) angle:** {planet_angle:.2f}°")
+st.write(f"**Moon (Trigger) angle:** {moon_angle:.2f}°")
+st.write(f"**Ascendant (Amplifier) angle:** {asc_angle:.2f}°")
+
+if aspect_planet_asc:
+    st.success(f"Framework planet ↔ Ascendant aspect: {aspect_planet_asc}°")
+if aspect_moon_planet:
+    st.success(f"Moon trigger ↔ Framework planet aspect: {aspect_moon_planet}°")
+if aspect_moon_asc:
+    st.success(f"Moon trigger ↔ Ascendant aspect: {aspect_moon_asc}°")
+
+if not any([aspect_planet_asc, aspect_moon_planet, aspect_moon_asc]):
+    st.info("No exact trigger aspects at this moment.")
+
+st.caption("🔑 Foundation: **Ascendant = amplifier, Moon = timing trigger, Planets = framework cycle.**")
