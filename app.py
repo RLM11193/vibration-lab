@@ -25,12 +25,29 @@ PLANET_KEY = {
 
 @st.cache(allow_output_mutation=True)
 def load_kernel():
-    eph = load("de421.bsp")
-    ts = load.timescale()
-    return eph, ts
+    """Load the Skyfield ephemeris and timescale.
+
+    Network access is required for the initial download of the
+    ``de421.bsp`` kernel.  In restricted environments (like tests or
+    CI where outbound network may be disabled) attempting to download
+    the file raises an ``OSError`` which previously crashed the app at
+    import time.  Instead of letting the exception propagate we catch
+    it and return ``(None, None)`` so the rest of the application can
+    handle the missing ephemeris gracefully.
+    """
+
+    try:
+        eph = load("de421.bsp")
+        ts = load.timescale()
+        return eph, ts
+    except OSError:
+        # Defer user-visible error messaging to the UI layer; returning
+        # ``None`` lets the app run in a degraded mode rather than
+        # failing during import.
+        return None, None
 
 eph, ts = load_kernel()
-earth = eph["earth"]
+earth = eph["earth"] if eph is not None else None
 
 # ---- Astro helpers ----
 def ecliptic_lon(planet_name: str, dt: datetime) -> float:
@@ -106,41 +123,47 @@ st.subheader("Planetary Framework & Triggers")
 
 dt = datetime.combine(start_date, start_time)
 
-try:
-    planet_lon = ecliptic_lon(framework_planet, dt)
-    moon_lon = ecliptic_lon("moon", dt)
-    asc_lon = ascendant_deg(dt, lon_east_deg=lon_east, lat_deg=lat)
-
-    a_pa = aspect(planet_lon, asc_lon)      # Planet ↔ Ascendant
-    a_mp = aspect(moon_lon, planet_lon)     # Moon ↔ Planet
-    a_ma = aspect(moon_lon, asc_lon)        # Moon ↔ Ascendant
-
-    st.write(f"**{framework_planet.capitalize()} (framework) angle:** {planet_lon:.2f}°")
-    st.write(f"**Moon (trigger) angle:** {moon_lon:.2f}°")
-    st.write(f"**Ascendant (amplifier) angle:** {asc_lon:.2f}°")
-
-    hits = []
-    if a_pa is not None:
-        hits.append(f"Framework planet ↔ Ascendant: **{a_pa}°**")
-    if a_mp is not None:
-        hits.append(f"Moon ↔ Framework planet: **{a_mp}°**")
-    if a_ma is not None:
-        hits.append(f"Moon ↔ Ascendant: **{a_ma}°**")
-
-    if hits:
-        for h in hits:
-            st.success(h)
-    else:
-        st.info("No exact trigger aspects (0/60/90/120/180) within 1.0° orb at the selected time.")
-
-except KeyError as e:
+if eph is None or ts is None or earth is None:
     st.error(
-        "Planet key not found in the de421 ephemeris. "
-        "Use these names: sun, moon, mercury, venus, mars, jupiter, saturn, uranus, neptune, pluto."
+        "Ephemeris data unavailable. Planetary angles and trigger aspects "
+        "cannot be computed without the 'de421.bsp' kernel."
     )
-    st.caption(f"Internal error: {e}")
-except Exception as e:
-    st.error("Unexpected error while computing planetary angles.")
-    st.caption(str(e))
+else:
+    try:
+        planet_lon = ecliptic_lon(framework_planet, dt)
+        moon_lon = ecliptic_lon("moon", dt)
+        asc_lon = ascendant_deg(dt, lon_east_deg=lon_east, lat_deg=lat)
+
+        a_pa = aspect(planet_lon, asc_lon)      # Planet ↔ Ascendant
+        a_mp = aspect(moon_lon, planet_lon)     # Moon ↔ Planet
+        a_ma = aspect(moon_lon, asc_lon)        # Moon ↔ Ascendant
+
+        st.write(f"**{framework_planet.capitalize()} (framework) angle:** {planet_lon:.2f}°")
+        st.write(f"**Moon (trigger) angle:** {moon_lon:.2f}°")
+        st.write(f"**Ascendant (amplifier) angle:** {asc_lon:.2f}°")
+
+        hits = []
+        if a_pa is not None:
+            hits.append(f"Framework planet ↔ Ascendant: **{a_pa}°**")
+        if a_mp is not None:
+            hits.append(f"Moon ↔ Framework planet: **{a_mp}°**")
+        if a_ma is not None:
+            hits.append(f"Moon ↔ Ascendant: **{a_ma}°**")
+
+        if hits:
+            for h in hits:
+                st.success(h)
+        else:
+            st.info("No exact trigger aspects (0/60/90/120/180) within 1.0° orb at the selected time.")
+
+    except KeyError as e:
+        st.error(
+            "Planet key not found in the de421 ephemeris. "
+            "Use these names: sun, moon, mercury, venus, mars, jupiter, saturn, uranus, neptune, pluto."
+        )
+        st.caption(f"Internal error: {e}")
+    except Exception as e:
+        st.error("Unexpected error while computing planetary angles.")
+        st.caption(str(e))
 
 st.caption("🔑 Foundation: **Ascendant = amplifier · Moon = timing trigger · Framework planet = cycle.**")
