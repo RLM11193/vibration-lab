@@ -1,104 +1,146 @@
-import streamlit as st
-import numpy as np
-from skyfield.api import load, Topos
-from datetime import datetime, timedelta
-import math
+# app.py  — Vibrations (Ascendant + Moon triggers, Skyfield de421-safe)
 
-# ✅ Must be first
+import streamlit as st
+import math
+from datetime import datetime
+from skyfield.api import load
+
+# ---- Streamlit must be first ----
 st.set_page_config(page_title="Vibrations", layout="wide")
 
-# Load planetary data
-planets = load('de421.bsp')
-earth = planets['earth']
-ts = load.timescale()
+# ---- Skyfield setup ----
+# de421.bsp uses *barycenter* names for outer planets.
+PLANET_KEY = {
+    "sun": "sun",
+    "moon": "moon",
+    "mercury": "mercury",
+    "venus": "venus",
+    "mars": "mars",
+    "jupiter": "jupiter barycenter",
+    "saturn": "saturn barycenter",
+    "uranus": "uranus barycenter",
+    "neptune": "neptune barycenter",
+    "pluto": "pluto barycenter",
+}
 
-# Location (BV, Colorado – change if needed)
-observer = Topos(latitude_degrees=38.84, longitude_degrees=-106.13)
+@st.cache(allow_output_mutation=True)
+def load_kernel():
+    eph = load("de421.bsp")
+    ts = load.timescale()
+    return eph, ts
 
-# Utility: planetary longitude (tropical for now, can add Lahiri sidereal later)
-def planetary_longitude(planet_name, date_time):
-    t = ts.utc(date_time.year, date_time.month, date_time.day, date_time.hour, date_time.minute)
-    astrometric = earth.at(t).observe(planets[planet_name])
-    apparent = astrometric.apparent()
-    lon, lat, distance = apparent.ecliptic_latlon()
-    return lon.degrees % 360
+eph, ts = load_kernel()
+earth = eph["earth"]
 
-# Utility: Ascendant degree
-def ascendant_longitude(date_time):
-    t = ts.utc(date_time.year, date_time.month, date_time.day, date_time.hour, date_time.minute)
-    astrometric = (earth + observer).at(t)
-    ra, dec, distance = astrometric.radec()
-    # Use Earth rotation angle as proxy for Ascendant
-    gst = t.gast
-    asc = (gst * 15) % 360
-    return asc
+# ---- Astro helpers ----
+def ecliptic_lon(planet_name: str, dt: datetime) -> float:
+    """Geocentric ecliptic longitude (degrees, 0–360) using de421 keys safely."""
+    key = PLANET_KEY[planet_name.lower()]
+    t = ts.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute)
+    lon, lat, _ = earth.at(t).observe(eph[key]).apparent().ecliptic_latlon()
+    return float(lon.degrees % 360.0)
 
-# Aspect check
-def check_aspects(angle1, angle2, orb=1.0):
-    aspects = [0, 60, 90, 120, 180]
-    for a in aspects:
-        if abs((angle1 - angle2) % 360 - a) <= orb or abs((angle2 - angle1) % 360 - a) <= orb:
+def ascendant_deg(dt: datetime, lon_east_deg: float = -106.13, lat_deg: float = 38.84) -> float:
+    """
+    Simple Ascendant proxy:
+    use local apparent sidereal time (GAST + longitude) as an ecliptic trigger angle.
+    (Fast & robust for intraday timing even if not a full astronomical ASC.)
+    """
+    t = ts.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute)
+    lst_deg = (t.gast * 15.0 + lon_east_deg) % 360.0
+    return lst_deg
+
+def aspect(angle1: float, angle2: float, orb: float = 1.0):
+    """Return exact aspect (0,60,90,120,180) within orb, else None."""
+    for a in (0, 60, 90, 120, 180):
+        d = (angle1 - angle2) % 360.0
+        d = min(d, 360.0 - d)
+        if abs(d - a) <= orb:
             return a
     return None
 
-# Sidebar inputs
-st.sidebar.header("Inputs")
-swing_low = st.sidebar.number_input("Swing Low Price", value=100.0, step=0.1)
-swing_high = st.sidebar.number_input("Swing High Price", value=200.0, step=0.1)
-bars = st.sidebar.number_input("Bars (time units)", value=30, step=1)
-target_planet = st.sidebar.selectbox("Framework Planet", ["saturn", "jupiter", "mars", "venus", "mercury", "sun"])
-start_date = st.sidebar.date_input("Start Date", datetime.utcnow().date())
-start_time = st.sidebar.time_input("Start Time", datetime.utcnow().time())
+# ---- Vibration math ----
+def price_vibration(low: float, high: float):
+    """Square-root delta → price angle → sin projection."""
+    diff = math.sqrt(max(high, 0.0)) - math.sqrt(max(low, 0.0))
+    ang = (diff * 180.0) % 360.0
+    proj = 144.0 * math.sin(math.radians(ang))
+    target = high - proj
+    return target, ang
 
-# Main title
-st.title("📊 Vibrational Harmonics with Ascendant & Moon Triggers")
+def time_vibration(bars: float):
+    """Sqrt(bars) → time angle → cos projection."""
+    ang = (math.sqrt(max(bars, 0.0)) * 180.0) % 360.0
+    proj = 225.0 * math.cos(math.radians(ang))
+    return bars + proj, ang
 
-# Price vibration
-def price_vibration(low, high):
-    diff = math.sqrt(high) - math.sqrt(low)
-    angle = (diff * 180) % 360
-    projection = 144 * math.sin(math.radians(angle))
-    target = high - projection
-    return target, angle
-
-# Time vibration
-def time_vibration(bars):
-    angle = (math.sqrt(bars) * 180) % 360
-    projection = 225 * math.cos(math.radians(angle))
-    return bars + projection, angle
-
-# Run calculations
-price_target, price_angle = price_vibration(swing_low, swing_high)
-time_target, time_angle = time_vibration(bars)
-
+# ---- UI ----
+st.title("Triggers")
 st.subheader("Vibration Targets")
-st.write(f"**Price Target:** {price_target:.2f} (Angle {price_angle:.2f}°)")
-st.write(f"**Time Target (bars):** {time_target:.2f} (Angle {time_angle:.2f}°)")
 
-# Planetary framework
-dt = datetime.combine(start_date, start_time)
-planet_angle = planetary_longitude(target_planet, dt)
-moon_angle = planetary_longitude("moon", dt)
-asc_angle = ascendant_longitude(dt)
+with st.sidebar:
+    st.header("Inputs")
+    low = st.number_input("Swing Low Price", value=100.00, step=0.01, format="%.2f")
+    high = st.number_input("Swing High Price", value=200.00, step=0.01, format="%.2f")
+    bars = st.number_input("Bars (time units)", value=30, step=1)
+    framework_planet = st.selectbox(
+        "Framework Planet",
+        ["saturn", "jupiter", "mars", "venus", "mercury", "sun"],
+        index=0,
+    )
+    start_date = st.date_input("Start Date", datetime.utcnow().date())
+    start_time = st.time_input("Start Time", datetime.utcnow().time())
+    # location (east positive)
+    lat = st.number_input("Latitude (deg)", value=38.84, step=0.01)
+    lon_west = st.number_input("Longitude West (deg, positive=West)", value=106.13, step=0.01)
+    lon_east = -float(lon_west)  # convert to east-positive
 
-aspect_planet_asc = check_aspects(planet_angle, asc_angle)
-aspect_moon_planet = check_aspects(moon_angle, planet_angle)
-aspect_moon_asc = check_aspects(moon_angle, asc_angle)
+# Compute vibration targets
+ptarget, pang = price_vibration(low, high)
+ttarget, tang = time_vibration(bars)
+st.write(f"**Price Target:** {ptarget:.2f} (Angle {pang:.2f}°)")
+st.write(f"**Time Target (bars):** {ttarget:.2f} (Angle {tang:.2f}°)")
 
-# Display planetary triggers
+# ---- Planetary framework & triggers ----
 st.subheader("Planetary Framework & Triggers")
-st.write(f"**{target_planet.capitalize()} (Framework) angle:** {planet_angle:.2f}°")
-st.write(f"**Moon (Trigger) angle:** {moon_angle:.2f}°")
-st.write(f"**Ascendant (Amplifier) angle:** {asc_angle:.2f}°")
 
-if aspect_planet_asc:
-    st.success(f"Framework planet ↔ Ascendant aspect: {aspect_planet_asc}°")
-if aspect_moon_planet:
-    st.success(f"Moon trigger ↔ Framework planet aspect: {aspect_moon_planet}°")
-if aspect_moon_asc:
-    st.success(f"Moon trigger ↔ Ascendant aspect: {aspect_moon_asc}°")
+dt = datetime.combine(start_date, start_time)
 
-if not any([aspect_planet_asc, aspect_moon_planet, aspect_moon_asc]):
-    st.info("No exact trigger aspects at this moment.")
+try:
+    planet_lon = ecliptic_lon(framework_planet, dt)
+    moon_lon = ecliptic_lon("moon", dt)
+    asc_lon = ascendant_deg(dt, lon_east_deg=lon_east, lat_deg=lat)
 
-st.caption("🔑 Foundation: **Ascendant = amplifier, Moon = timing trigger, Planets = framework cycle.**")
+    a_pa = aspect(planet_lon, asc_lon)      # Planet ↔ Ascendant
+    a_mp = aspect(moon_lon, planet_lon)     # Moon ↔ Planet
+    a_ma = aspect(moon_lon, asc_lon)        # Moon ↔ Ascendant
+
+    st.write(f"**{framework_planet.capitalize()} (framework) angle:** {planet_lon:.2f}°")
+    st.write(f"**Moon (trigger) angle:** {moon_lon:.2f}°")
+    st.write(f"**Ascendant (amplifier) angle:** {asc_lon:.2f}°")
+
+    hits = []
+    if a_pa is not None:
+        hits.append(f"Framework planet ↔ Ascendant: **{a_pa}°**")
+    if a_mp is not None:
+        hits.append(f"Moon ↔ Framework planet: **{a_mp}°**")
+    if a_ma is not None:
+        hits.append(f"Moon ↔ Ascendant: **{a_ma}°**")
+
+    if hits:
+        for h in hits:
+            st.success(h)
+    else:
+        st.info("No exact trigger aspects (0/60/90/120/180) within 1.0° orb at the selected time.")
+
+except KeyError as e:
+    st.error(
+        "Planet key not found in the de421 ephemeris. "
+        "Use these names: sun, moon, mercury, venus, mars, jupiter, saturn, uranus, neptune, pluto."
+    )
+    st.caption(f"Internal error: {e}")
+except Exception as e:
+    st.error("Unexpected error while computing planetary angles.")
+    st.caption(str(e))
+
+st.caption("🔑 Foundation: **Ascendant = amplifier · Moon = timing trigger · Framework planet = cycle.**")
