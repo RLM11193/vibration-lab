@@ -17,7 +17,7 @@ except Exception as e:
 
 # Sidereal/Lahiri as discussed
 swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
-# Use Moshier model so it runs without downloading ephemeris files
+# Use Moshier planetary model (works without ephemeris files)
 EPH_FLAGS = swe.FLG_SIDEREAL | swe.FLG_MOSEPH
 
 PLANETS = {
@@ -28,8 +28,8 @@ PLANETS = {
     "Mars":    swe.MARS,
     "Sun":     swe.SUN,
     "Moon":    swe.MOON,
-    "Rahu":    swe.MEAN_NODE,  # Mean node, matches your Panchang screenshots
-    "Ketu":    swe.TRUE_NODE,  # True node for the opposite point
+    "Rahu":    swe.MEAN_NODE,  # matches your Panchang screenshots
+    "Ketu":    swe.TRUE_NODE,
 }
 
 # ----- Helpers -----
@@ -39,15 +39,19 @@ def jd_ut(dt_utc: datetime) -> float:
     return swe.julday(y, m, d, h, swe.GREG_CAL)
 
 def planet_lon(dt_utc: datetime, name: str) -> float:
-    # FIXED: correct unpack from swe.calc_ut
+    # CORRECT unpack from swe.calc_ut: (pos, retflag), pos[0] = ecliptic longitude
     pos, _ = swe.calc_ut(jd_ut(dt_utc), PLANETS[name], EPH_FLAGS)
-    lon = pos[0]
+    lon = float(pos[0])
     return lon % 360.0
 
 def ascendant(dt_utc: datetime, lat: float, lon_east: float) -> float:
-    # Placidus houses; ascmc[0] is Ascendant
-    _, ascmc = swe.houses_ex(jd_ut(dt_utc), EPH_FLAGS, lat, lon_east, b'P')
-    return ascmc[0] % 360.0
+    """
+    Robust Ascendant using swe.houses (no flags).
+    Signature: houses(jd_ut, lat, lon_east) -> (cusps[1..12], ascmc[0..9])
+    ascmc[0] = Ascendant longitude.
+    """
+    cusps, ascmc = swe.houses(jd_ut(dt_utc), lat, lon_east)
+    return float(ascmc[0]) % 360.0
 
 def wrap_diff(a: float, b: float) -> float:
     """Signed minimal angular difference in (-180, 180]."""
@@ -63,9 +67,8 @@ def price_angle(P: float) -> float:
 
 def time_echo_bars(theta_target: float, max_bars: int):
     """
-    Simple 'echo' rule we’ve been using:
+    Echo rule used in our tests:
     n ≈ round((theta/180 + 2k)^2), k = 1,2,... up to max_bars
-    (You can swap in any alternative mapping later.)
     """
     s0 = theta_target / 180.0
     out, k = [], 1
@@ -147,7 +150,7 @@ with st.container():
         st.caption("Use the exact minute of the pivot (event-time).")
         lat   = st.number_input("Latitude (deg)", value=38.84, step=0.01)
         lonW  = st.number_input("Longitude West (deg, positive=West)", value=106.13, step=0.01)
-        lonE  = -abs(lonW)  # Swiss Ephemeris wants East-positive
+        lonE  = -abs(lonW)  # Swiss Ephemeris expects East-positive
         tol   = st.slider("Angular tolerance (±°)", 0.2, 2.0, 1.0, 0.1)
         mobile = st.toggle("Mobile mode (optimize speed)", value=True)
 
